@@ -108,9 +108,10 @@ export function SiteHealthProvider({
   const [isChecking, setIsChecking] = useState(false);
   const checkingRef = useRef(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Sites queued for a manual recheck while a check is already in
-  // progress - drained once the current run finishes.
-  const pendingRecheckRef = useRef<Set<string> | null>(null);
+  // Set when a recheck is requested while a check is already running -
+  // triggers one more full run right after the current one finishes,
+  // instead of tracking which specific sites were requested.
+  const pendingRecheckRef = useRef(false);
 
   const connectivity = useConnectivity();
   // Read inside async functions/timers without stale-closure issues -
@@ -119,9 +120,8 @@ export function SiteHealthProvider({
   const connectivityRef = useRef(connectivity.status);
   connectivityRef.current = connectivity.status;
 
-  // Runs the actual check loop for a subset of sites, updating state and
-  // persisting to disk after each one so progress isn't lost if the app
-  // backgrounds mid-check.
+  // Runs the check loop for a subset of sites and commits once at the end
+  // - no per-site state or disk writes while the loop is running.
   //
   // If the device itself has no internet, this is a no-op: a check run
   // while offline can only ever come back "offline" for every site
@@ -140,77 +140,91 @@ export function SiteHealthProvider({
     }
 
     if (checkingRef.current) {
-      // Already checking (e.g. the periodic sweep) - queue these sites for
-      // a manual recheck right after the current run finishes instead of
-      // dropping the request.
-      if (!pendingRecheckRef.current) pendingRecheckRef.current = new Set();
-      sitesToCheck.forEach((s) => pendingRecheckRef.current!.add(s.name));
+      // Already checking (e.g. the periodic sweep) - flag for one more
+      // full run right after the current one finishes. The manual Recheck
+      // button covers the "I want this specific site now" case, so this
+      // doesn't need to track which sites were asked for.
+      pendingRecheckRef.current = true;
       return;
     }
 
     checkingRef.current = true;
     setIsChecking(true);
 
-    const updated: Record<string, SiteStatus> = { ...baseStatuses };
-    sitesToCheck.forEach((site) => {
-      updated[site.name] = "checking";
+    // Mark targets "checking" once, up front - a static indicator rather
+    // than live per-site updates as each one resolves.
+    setStatuses((prev) => {
+      const next = { ...prev };
+      sitesToCheck.forEach((site) => {
+        next[site.name] = "checking";
+      });
+      return next;
     });
-    setStatuses({ ...updated });
+
+    const results: Record<string, SiteStatus> = {};
+    const newDetails: Record<string, SiteStatusDetail> = {};
+    let aborted = false;
 
     for (const site of sitesToCheck) {
-      // Connectivity can drop (or still not have resolved) mid-run - bail
-      // out immediately rather than marking every remaining site
-      // "offline", and reset anything this run had already flagged
-      // "checking" back to whatever it was before this run started.
+      // Connectivity can drop (or still not have resolved) mid-run - stop
+      // immediately and commit nothing from this run; sites left showing
+      // "checking" get reverted to their last saved state below, not left
+      // stuck and not marked "offline".
       if (connectivityRef.current !== "online") {
-        sitesToCheck.forEach((s) => {
-          if (updated[s.name] === "checking") {
-            updated[s.name] = baseStatuses[s.name] ?? "idle";
-          }
-        });
-        setStatuses({ ...updated });
+        aborted = true;
         break;
       }
 
       try {
         const result = await checkSiteHealthDetailed(site.baseUrl);
-        updated[site.name] = result.state;
-        setDetails((prev) => ({
-          ...prev,
-          [site.name]: {
-            statusCode: result.statusCode,
-            responseTime: result.responseTime,
-            tier: result.tier,
-            error: result.error,
-            checkedAt: Date.now(),
-          },
-        }));
+        results[site.name] = result.state;
+        newDetails[site.name] = {
+          statusCode: result.statusCode,
+          responseTime: result.responseTime,
+          tier: result.tier,
+          error: result.error,
+          checkedAt: Date.now(),
+        };
       } catch (error: any) {
-        updated[site.name] = "offline";
-        setDetails((prev) => ({
-          ...prev,
-          [site.name]: {
-            error: error?.message || "Unknown error",
-            checkedAt: Date.now(),
-          },
-        }));
+        results[site.name] = "offline";
+        newDetails[site.name] = {
+          error: error?.message || "Unknown error",
+          checkedAt: Date.now(),
+        };
       }
-      setStatuses({ ...updated });
-      await saveSiteStatus(updated);
-      // Small delay between sites so we're not firing everything at once.
-      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    let finalStatuses = baseStatuses;
+
+    if (aborted) {
+      // Revert "checking" back to the last known saved state (or "idle"
+      // if this site has never completed a check before). Nothing is
+      // written to disk for an aborted run.
+      setStatuses((prev) => {
+        const reverted = { ...prev };
+        sitesToCheck.forEach((site) => {
+          reverted[site.name] = baseStatuses[site.name] ?? "idle";
+        });
+        return reverted;
+      });
+    } else {
+      finalStatuses = { ...baseStatuses, ...results };
+      setStatuses((prev) => ({ ...prev, ...results }));
+      setDetails((prev) => ({ ...prev, ...newDetails }));
+      await saveSiteStatus(finalStatuses);
     }
 
     checkingRef.current = false;
-    setIsChecking(false);
 
-    // Drain anything queued via recheck() while this run was in flight.
-    if (pendingRecheckRef.current && pendingRecheckRef.current.size > 0) {
-      const queued = SUPPORTED_SITES.filter((s) =>
-        pendingRecheckRef.current!.has(s.name),
-      );
-      pendingRecheckRef.current = null;
-      await runHealthChecks(queued, updated);
+    // If a recheck was requested while this run was in flight, go
+    // straight into it - keep isChecking (and the disabled Recheck
+    // button) on the whole time instead of flipping off and back on
+    // between the two runs.
+    if (pendingRecheckRef.current) {
+      pendingRecheckRef.current = false;
+      await runHealthChecks(SUPPORTED_SITES, finalStatuses);
+    } else {
+      setIsChecking(false);
     }
   };
 
@@ -241,10 +255,10 @@ export function SiteHealthProvider({
     //   ("initializing") -> show whatever's cached, however old, and don't
     //   attempt a check at all. A check with no confirmed internet can
     //   only produce false "offline" readings for every site - better to
-    //   stay true to the last real result. Unlike before, there's no
-    //   separate reconnect-trigger effect - the next legitimate check is
-    //   the next stale (12h) auto-check or an explicit tap of Recheck, not
-    //   the moment connectivity happens to come back.
+    //   stay true to the last real result. There's no separate
+    //   reconnect-trigger effect - the next legitimate check is the next
+    //   stale (12h) auto-check or an explicit tap of Recheck, not the
+    //   moment connectivity happens to come back.
     const init = async () => {
       const saved = await loadSavedSiteStatus();
 
@@ -253,20 +267,9 @@ export function SiteHealthProvider({
 
         if (connectivityRef.current !== "online") return;
 
-        const missing = SUPPORTED_SITES.filter(
-          (site) =>
-            !saved.statuses[site.name] || saved.statuses[site.name] === "idle",
-        );
-
         const isStale = Date.now() - saved.timestamp >= CACHE_VALID_MS;
-
         if (isStale) {
-          // Stale: refresh everything, not just the missing ones.
           await runHealthChecks(SUPPORTED_SITES, saved.statuses);
-        } else if (missing.length > 0) {
-          // Fresh but incomplete (e.g. a source was added after the cache
-          // was written) - fill in just the gaps.
-          await runHealthChecks(missing, saved.statuses);
         }
       } else if (connectivityRef.current === "online") {
         // No cache at all - first run, and connectivity is confirmed.
